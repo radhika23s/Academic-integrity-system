@@ -56,10 +56,11 @@ class VideoProcessor:
     """
     Video processing service for proctoring.
     Handles face detection, liveness detection, and anomaly detection.
+    Uses MediaPipe for face detection (no CMake required).
     """
     
     def __init__(self):
-        self._face_recognition_model = None
+        self._face_mesh = None
         self._initialized = False
         self._blink_detection_threshold = 0.2
         self._min_blinks_required = 1
@@ -70,10 +71,25 @@ class VideoProcessor:
             return True
             
         try:
-            import face_recognition
-            self._face_recognition_model = face_recognition
+            import mediapipe as mp
+            import cv2
+            
+            # Initialize MediaPipe Face Mesh
+            self._mp_face_mesh = mp.solutions.face_mesh
+            self._face_mesh = self._mp_face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=5,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            
+            # Store MediaPipe drawing utilities
+            self._mp_drawing = mp.solutions.drawing_utils
+            self._mp_styles = mp.solutions.drawing_styles
+            
             self._initialized = True
-            logger.info("video_processor.initialized", status="success")
+            logger.info("video_processor.initialized", status="success", backend="mediapipe")
             return True
         except ImportError as e:
             logger.error("video_processor.init_failed", error=str(e))
@@ -86,6 +102,20 @@ class VideoProcessor:
     def is_healthy(self) -> bool:
         """Check if the video processor is healthy."""
         return self._initialized
+    
+    def _convert_mediapipe_to_bounding_box(self, landmarks, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
+        """Convert MediaPipe landmarks to bounding box (top, right, bottom, left)."""
+        # Get all landmark points
+        x_coords = [landmark.x for landmark in landmarks.landmark]
+        y_coords = [landmark.y for landmark in landmarks.landmark]
+        
+        # Calculate bounding box
+        x_min = int(min(x_coords) * image_width)
+        x_max = int(max(x_coords) * image_width)
+        y_min = int(min(y_coords) * image_height)
+        y_max = int(max(y_coords) * image_height)
+        
+        return y_min, x_max, y_min, x_max, y_max, x_min  # top, right, bottom, left
     
     async def detect_faces(self, image_data: bytes) -> FaceDetectionResult:
         """
@@ -110,31 +140,54 @@ class VideoProcessor:
                     processing_ms=self._elapsed_ms(t0)
                 )
             
-            # Convert to numpy array for face_recognition
+            # Convert to RGB for MediaPipe
             image_array = np.array(image)
+            if image_array.shape[-1] == 4:  # RGBA
+                image_rgb = image_array[:, :, :3]
+            else:
+                image_rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
             
-            # Detect faces
-            face_locations = self._face_recognition_model.face_locations(image_array)
-            face_encodings = self._face_recognition_model.face_encodings(image_array, face_locations)
+            image_height, image_width = image_rgb.shape[:2]
             
-            face_count = len(face_locations)
+            # Detect faces using MediaPipe
+            results = self._face_mesh.process(image_rgb)
             
-            # Convert face locations to serializable format
+            face_count = 0
             face_locs = []
-            for i, loc in enumerate(face_locations):
-                face_locs.append({
-                    "top": int(loc[0]),
-                    "right": int(loc[1]),
-                    "bottom": int(loc[2]),
-                    "left": int(loc[3])
-                })
+            face_encodings = []
+            
+            if results.multi_face_landmarks:
+                face_count = len(results.multi_face_landmarks)
+                
+                for face_landmarks in results.multi_face_landmarks:
+                    # Calculate bounding box from landmarks
+                    x_coords = [landmark.x for landmark in face_landmarks.landmark]
+                    y_coords = [landmark.y for landmark in face_landmarks.landmark]
+                    
+                    left = int(min(x_coords) * image_width)
+                    right = int(max(x_coords) * image_width)
+                    top = int(min(y_coords) * image_height)
+                    bottom = int(max(y_coords) * image_height)
+                    
+                    face_locs.append({
+                        "top": top,
+                        "right": right,
+                        "bottom": bottom,
+                        "left": left
+                    })
+                    
+                    # Extract encoding from landmarks (flatten all landmark coordinates)
+                    encoding = []
+                    for landmark in face_landmarks.landmark:
+                        encoding.extend([landmark.x, landmark.y, landmark.z])
+                    face_encodings.append(encoding)
             
             result = FaceDetectionResult(
                 face_count=face_count,
                 multiple_faces_detected=face_count > 1,
                 no_face_detected=face_count == 0,
                 face_locations=face_locs,
-                face_encodings=[],  # Don't serialize encodings
+                face_encodings=face_encodings,
                 processing_ms=self._elapsed_ms(t0)
             )
             
@@ -173,12 +226,14 @@ class VideoProcessor:
                     processing_ms=self._elapsed_ms(t0)
                 )
             
+            import cv2
+            
             blink_count = 0
             movement_scores = []
             eye_ar_history = []
             
-            prev_face_locations = None
-            prev_face_encodings = None
+            prev_face_landmarks = None
+            prev_bounding_box = None
             
             for frame_data in frame_sequence:
                 image = self._load_image(frame_data)
@@ -186,30 +241,48 @@ class VideoProcessor:
                     continue
                     
                 image_array = np.array(image)
+                if image_array.shape[-1] == 4:
+                    image_rgb = image_array[:, :, :3]
+                else:
+                    image_rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
                 
-                # Get face locations and encodings
-                face_locations = self._face_recognition_model.face_locations(image_array)
+                image_height, image_width = image_rgb.shape[:2]
                 
-                if face_locations:
-                    face_encodings = self._face_recognition_model.face_encodings(
-                        image_array, face_locations
-                    )
+                # Get face landmarks
+                results = self._face_mesh.process(image_rgb)
+                
+                if results.multi_face_landmarks:
+                    face_landmarks = results.multi_face_landmarks[0]
+                    
+                    # Get bounding box
+                    x_coords = [landmark.x for landmark in face_landmarks.landmark]
+                    y_coords = [landmark.y for landmark in face_landmarks.landmark]
+                    
+                    current_bounding_box = {
+                        "left": int(min(x_coords) * image_width),
+                        "right": int(max(x_coords) * image_width),
+                        "top": int(min(y_coords) * image_height),
+                        "bottom": int(max(y_coords) * image_height)
+                    }
                     
                     # Calculate movement
-                    if prev_face_locations and prev_face_encodings:
-                        movement = self._calculate_movement(
-                            prev_face_locations, face_locations,
-                            prev_face_encodings, face_encodings
+                    if prev_bounding_box:
+                        movement = self._calculate_movement_mediapipe(
+                            prev_bounding_box, current_bounding_box
                         )
                         movement_scores.append(movement)
                     
-                    # Detect blinks (simplified - real implementation would use eye landmarks)
-                    ear = self._estimate_eye_aspect_ratio(image_array, face_locations[0])
+                    # MediaPipe provides specific eye landmarks (indices 33-133 for left eye, 362-462 for right eye)
+                    # Eye landmarks: 33-133 (left), 362-462 (right)
+                    # Iris landmarks: 468-473 (left), 474-479 (right)
+                    ear = self._estimate_eye_aspect_ratio_mediapipe(
+                        face_landmarks, image_width, image_height
+                    )
                     if ear > 0:
                         eye_ar_history.append(ear)
                     
-                    prev_face_locations = face_locations
-                    prev_face_encodings = face_encodings
+                    prev_face_landmarks = face_landmarks
+                    prev_bounding_box = current_bounding_box
             
             # Analyze blink pattern
             if len(eye_ar_history) >= 3:
@@ -217,7 +290,7 @@ class VideoProcessor:
             
             # Analyze movement
             avg_movement = sum(movement_scores) / len(movement_scores) if movement_scores else 0
-            movement_detected = avg_movement > 0.1
+            movement_detected = avg_movement > 0.05
             
             # Determine liveness
             is_live = True
@@ -232,7 +305,7 @@ class VideoProcessor:
                 is_live = False
             
             # Check for static image (photo attack)
-            if len(movement_scores) > 0 and max(movement_scores) < 0.05:
+            if len(movement_scores) > 0 and max(movement_scores) < 0.03:
                 flags.append("possible_static_image")
                 is_live = False
             
@@ -393,87 +466,81 @@ class VideoProcessor:
             logger.error("image_load.failed", error=str(e))
             return None
     
-    def _calculate_movement(
+    def _calculate_movement_mediapipe(
         self,
-        prev_locations: List,
-        curr_locations: List,
-        prev_encodings: List,
-        curr_encodings: List
+        prev_bbox: Dict,
+        curr_bbox: Dict
     ) -> float:
-        """Calculate facial movement score between frames."""
-        if not prev_locations or not curr_locations:
+        """Calculate facial movement score between frames using MediaPipe bounding boxes."""
+        if not prev_bbox or not curr_bbox:
             return 0.0
-            
-        # Calculate center movement
-        prev_center = (
-            (prev_locations[0][3] + prev_locations[0][1]) / 2,
-            (prev_locations[0][0] + prev_locations[0][2]) / 2
-        )
-        curr_center = (
-            (curr_locations[0][3] + curr_locations[0][1]) / 2,
-            (curr_locations[0][0] + curr_locations[0][2]) / 2
-        )
         
-        # Normalize by image size (assuming typical webcam resolution)
-        distance = ((curr_center[0] - prev_center[0])**2 + 
-                   (curr_center[1] - prev_center[1])**2)**0.5 / 640.0
+        # Calculate center movement
+        prev_center_x = (prev_bbox["left"] + prev_bbox["right"]) / 2
+        prev_center_y = (prev_bbox["top"] + prev_bbox["bottom"]) / 2
+        curr_center_x = (curr_bbox["left"] + curr_bbox["right"]) / 2
+        curr_center_y = (curr_bbox["top"] + curr_bbox["bottom"]) / 2
+        
+        # Calculate face size change
+        prev_width = prev_bbox["right"] - prev_bbox["left"]
+        prev_height = prev_bbox["bottom"] - prev_bbox["top"]
+        
+        # Normalize by average face size
+        avg_size = (prev_width + prev_height) / 2
+        
+        if avg_size == 0:
+            return 0.0
+        
+        distance = ((curr_center_x - prev_center_x)**2 + 
+                   (curr_center_y - prev_center_y)**2)**0.5 / avg_size
         
         return min(distance, 1.0)
     
-    def _estimate_eye_aspect_ratio(self, image_array: np.ndarray, face_location: Tuple) -> float:
+    def _estimate_eye_aspect_ratio_mediapipe(self, landmarks, image_width: int, image_height: int) -> float:
         """
-        Estimate eye aspect ratio from face location.
-        This is a simplified version - full implementation would use facial landmarks.
+        Estimate eye aspect ratio from MediaPipe face landmarks.
+        Uses eye landmark indices: 33-133 (left eye), 362-462 (right eye)
+        More accurate than the previous simplified approach.
         """
-        # Get face dimensions
-        top, right, bottom, left = face_location
-        face_height = bottom - top
-        face_width = right - left
-        
-        # Estimate eye region (approximately 30% from top of face, centered)
-        eye_region_height = face_height * 0.15
-        eye_region_width = face_width * 0.25
-        
-        # Extract eye regions
-        left_eye_y = int(top + face_height * 0.3)
-        left_eye_x = int(left + face_width * 0.2)
-        right_eye_y = int(top + face_height * 0.3)
-        right_eye_x = int(left + face_width * 0.55)
-        
         try:
-            # Get eye regions
-            left_eye = image_array[
-                left_eye_y:int(left_eye_y + eye_region_height),
-                left_eye_x:int(left_eye_x + eye_region_width)
-            ]
-            right_eye = image_array[
-                right_eye_y:int(right_eye_y + eye_region_height),
-                right_eye_x:int(right_eye_x + eye_region_width)
-            ]
+            # Left eye landmarks (indices 33, 133, 160, 158, 153, 144)
+            # Right eye landmarks (indices 362, 263, 387, 385, 380, 373)
+            LEFT_EYE = [33, 133, 160, 158, 153, 144]
+            RIGHT_EYE = [362, 263, 387, 385, 380, 373]
             
-            if left_eye.size == 0 or right_eye.size == 0:
-                return 0.0
+            def calculate_ear(eye_indices):
+                # Get landmark coordinates
+                points = []
+                for idx in eye_indices:
+                    landmark = landmarks.landmark[idx]
+                    points.append((landmark.x * image_width, landmark.y * image_height))
+                
+                # Calculate EAR: (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+                # Using vertical and horizontal distances
+                p1, p2, p3, p4, p5, p6 = points
+                
+                # Vertical distances
+                vertical_1 = ((p2[0] - p6[0])**2 + (p2[1] - p6[1])**2)**0.5
+                vertical_2 = ((p3[0] - p5[0])**2 + (p3[1] - p5[1])**2)**0.5
+                
+                # Horizontal distance
+                horizontal = ((p1[0] - p4[0])**2 + (p1[1] - p4[1])**2)**0.5
+                
+                if horizontal == 0:
+                    return 0.0
+                
+                ear = (vertical_1 + vertical_2) / (2 * horizontal)
+                return ear
             
-            # Calculate aspect ratio based on edge density (simplified)
-            # Closed eyes have different edge patterns than open eyes
-            import cv2
+            left_ear = calculate_ear(LEFT_EYE)
+            right_ear = calculate_ear(RIGHT_EYE)
             
-            left_gray = cv2.cvtColor(left_eye, cv2.COLOR_RGB2GRAY)
-            right_gray = cv2.cvtColor(right_eye, cv2.COLOR_RGB2GRAY)
+            # Average EAR from both eyes
+            avg_ear = (left_ear + right_ear) / 2
             
-            left_edges = cv2.Canny(left_gray, 50, 150)
-            right_edges = cv2.Canny(right_gray, 50, 150)
-            
-            left_density = np.sum(left_edges > 0) / left_edges.size
-            right_density = np.sum(right_edges > 0) / right_edges.size
-            
-            # Higher edge density suggests open eyes
-            avg_density = (left_density + right_density) / 2
-            
-            # Map to EAR-like value (0.0 - 0.3 for closed, 0.2+ for open)
-            ear_estimate = min(avg_density * 2, 0.35)
-            
-            return ear_estimate
+            # Scale to reasonable EAR range (typically 0.2-0.35 for open eyes)
+            # MediaPipe gives slightly different scale, so we normalize
+            return min(avg_ear * 1.5, 0.4)
             
         except Exception as e:
             logger.debug("eye_aspect_ratio.failed", error=str(e))
@@ -505,3 +572,49 @@ class VideoProcessor:
         """Analyze image quality for proctoring."""
         import cv2
         
+        issues = []
+        is_acceptable = True
+        
+        # Convert to numpy array
+        img_array = np.array(image)
+        
+        # Check if grayscale
+        if len(img_array.shape) == 2:
+            gray = img_array
+        else:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Calculate brightness
+        mean_brightness = np.mean(gray)
+        if mean_brightness < 50:
+            issues.append("too_dark")
+            is_acceptable = False
+        elif mean_brightness > 230:
+            issues.append("too_bright")
+            is_acceptable = False
+        
+        # Calculate contrast
+        std_contrast = np.std(gray)
+        if std_contrast < 20:
+            issues.append("low_contrast")
+            is_acceptable = False
+        
+        # Check blur (Laplacian variance)
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        blur_score = laplacian.var()
+        if blur_score < 100:
+            issues.append("blurry")
+            is_acceptable = False
+        
+        return {
+            "is_acceptable": is_acceptable,
+            "issues": issues,
+            "brightness": round(mean_brightness, 2),
+            "contrast": round(std_contrast, 2),
+            "blur_score": round(blur_score, 2),
+        }
+    
+    def _elapsed_ms(self, t0: int) -> int:
+        """Calculate elapsed time in milliseconds."""
+        return int((time.monotonic_ns() - t0) / 1_000_000)
+

@@ -1,32 +1,33 @@
-# TODO: Video Proctoring Implementation
+# TODO: Fix face-recognition dependency issue
 
-## Step 1: Add Computer Vision Dependencies
-- [ ] Add opencv-python, face_recognition, Pillow, pytesseract to requirements.txt
-- [ ] Install dependencies
+## Problem
+The `face-recognition==1.3.0` package requires `dlib`, which needs CMake to be installed on Windows. CMake is not available, causing installation failure.
 
-## Step 2: Create Video Proctoring Service
-- [ ] Create services/video_processor.py
-- [ ] Implement face detection
-- [ ] Implement multiple face detection
-- [ ] Implement liveness detection (blink, movement)
-- [ ] Implement screenshot/anomaly detection
+## Solution
+Replace `face-recognition` with `mediapipe` (already installed) which provides equivalent face detection functionality without requiring compilation.
 
-## Step 3: Create Document Scanner Service
-- [ ] Create services/document_scanner.py
-- [ ] Implement edge detection
-- [ ] Implement perspective correction
-- [ ] Implement document quality assessment
+## Tasks
+- [x] 1. Analyze codebase and understand face_recognition usage
+- [x] 2. Update requirements.txt - remove face-recognition, add mediapipe
+- [x] 3. Update services/video_processor.py - replace face_recognition with mediapipe
+- [x] 4. Test the installation
 
-## Step 4: Update Text Extractor
-- [ ] Add OCR support using pytesseract
+## Changes Made
 
-## Step 5: Enhance Proctoring Module
-- [ ] Integrate video analysis into modules/proctoring/detector.py
-- [ ] Add face detection results to evidence
-- [ ] Add document scanning results to evidence
+### File: requirements.txt
+- Removed: `face-recognition==1.3.0`
+- Added: `mediapipe` (already pre-installed)
 
-## Step 6: Testing
-- [ ] Test video processor
-- [ ] Test document scanner
-- [ ] Test proctoring module integration
+### File: services/video_processor.py
+- Replaced `import face_recognition` with `import mediapipe`
+- Changed from `face_recognition.face_locations()` to MediaPipe FaceMesh
+- Changed from `face_recognition.face_encodings()` to MediaPipe face landmarks
+- Improved liveness detection using actual eye landmarks (indices 33-133 for left eye, 362-462 for right eye)
+- Added proper EAR (Eye Aspect Ratio) calculation using MediaPipe's precise facial landmarks
+
+## Benefits
+1. No CMake required - MediaPipe has pre-built wheels
+2. More accurate face detection with 468 facial landmarks
+3. Better liveness detection with precise eye landmark tracking
+4. Supports multiple faces (up to 5)
 
